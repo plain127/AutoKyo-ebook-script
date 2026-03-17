@@ -438,6 +438,11 @@ def _install_mcp_server(
             "--",
             *invocation,
         ]
+    else:
+        remove_command = []
+        install_command = []
+
+    if normalized_client in {"codex", "claude"}:
         payload = {
             "status": "ready" if dry_run else "completed",
             "client": normalized_client,
