@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import time
 
 from autokyo.actions import AutomationError, get_mouse_position
@@ -31,7 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("run", help="Run the capture loop")
     subparsers.add_parser("probe", help="Capture and save one page-check region sample")
     subparsers.add_parser("status", help="Print session state JSON if present")
-    pdf_parser = subparsers.add_parser("make-pdf", help="Combine images in a folder into one PDF")
+    pdf_parser = subparsers.add_parser(
+        "make-pdf",
+        aliases=["pdf"],
+        help="Combine images in a folder into one PDF",
+    )
     pdf_parser.add_argument(
         "--input",
         default="./captures",
@@ -132,7 +139,39 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete exported captures after a successful PDF build. Requires --make-pdf",
     )
-    mousepos_parser = subparsers.add_parser("mousepos", help="Print current mouse coordinates")
+    mcp_install_parser = subparsers.add_parser(
+        "mcp-install",
+        aliases=["mcp-register"],
+        help="Register AutoKyo as a local Codex MCP server",
+    )
+    mcp_install_parser.add_argument(
+        "client",
+        nargs="?",
+        choices=["codex"],
+        default="codex",
+        help="MCP client to register with. Defaults to codex",
+    )
+    mcp_install_parser.add_argument(
+        "--name",
+        default="autokyo",
+        help="Registered MCP server name. Defaults to autokyo",
+    )
+    mcp_install_parser.add_argument(
+        "--python",
+        dest="python_executable",
+        default=None,
+        help="Optional Python executable to use for the MCP server command",
+    )
+    mcp_install_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the registration command without running it",
+    )
+    mousepos_parser = subparsers.add_parser(
+        "mousepos",
+        aliases=["coords"],
+        help="Print current mouse coordinates",
+    )
     mousepos_parser.add_argument(
         "--watch",
         action="store_true",
@@ -155,10 +194,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "mcp":
             return run_stdio_server(default_config_path=args.config)
 
-        if args.command == "mousepos":
+        if args.command in {"mousepos", "coords"}:
             return _run_mousepos(watch=bool(args.watch), interval=float(args.interval))
 
-        if args.command == "make-pdf":
+        if args.command in {"make-pdf", "pdf"}:
             summary = build_pdf_from_directory(
                 Path(args.input),
                 Path(args.output),
@@ -180,6 +219,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+
+        if args.command in {"mcp-install", "mcp-register"}:
+            return _install_mcp_server(
+                client=args.client,
+                server_name=args.name,
+                config_path=Path(args.config),
+                python_executable=args.python_executable,
+                dry_run=bool(args.dry_run),
+            )
 
         if args.command == "export-photos-to-captures":
             if args.delete_source and not args.make_pdf:
@@ -334,3 +382,80 @@ def _run_mousepos(*, watch: bool, interval: float) -> int:
             time.sleep(interval)
     except KeyboardInterrupt:
         return 0
+
+
+def _install_mcp_server(
+    *,
+    client: str,
+    server_name: str,
+    config_path: Path,
+    python_executable: str | None,
+    dry_run: bool,
+) -> int:
+    if client != "codex":
+        raise ValueError(f"Unsupported MCP client: {client}")
+
+    codex_executable = shutil.which("codex")
+    if codex_executable is None:
+        raise ValueError("Could not find 'codex' on PATH")
+
+    resolved_config = config_path.expanduser().resolve()
+    invocation = _build_local_mcp_invocation(
+        config_path=resolved_config,
+        python_executable=python_executable,
+    )
+    remove_command = [codex_executable, "mcp", "remove", server_name]
+    add_command = [codex_executable, "mcp", "add", server_name, "--", *invocation]
+
+    payload = {
+        "status": "ready" if dry_run else "completed",
+        "client": client,
+        "name": server_name,
+        "config_path": str(resolved_config),
+        "server_command": invocation,
+        "codex_add_command": add_command,
+    }
+
+    if dry_run:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    subprocess.run(remove_command, check=False, capture_output=True, text=True)
+    subprocess.run(add_command, check=True)
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0
+
+
+def _build_local_mcp_invocation(
+    *,
+    config_path: Path,
+    python_executable: str | None,
+) -> list[str]:
+    python_path = _resolve_python_executable(python_executable)
+    project_root = Path(__file__).resolve().parent.parent
+    main_script = project_root / "main.py"
+
+    if main_script.exists():
+        return [str(python_path), str(main_script), "--config", str(config_path), "mcp"]
+
+    return [str(python_path), "-m", "autokyo", "--config", str(config_path), "mcp"]
+
+
+def _resolve_python_executable(python_executable: str | None) -> Path:
+    if python_executable:
+        return Path(python_executable).expanduser().resolve()
+
+    candidates: list[Path] = []
+    for command_name in ("python3", "python"):
+        command_path = shutil.which(command_name)
+        if command_path:
+            path = Path(command_path).expanduser().resolve()
+            if ".venv" not in path.parts:
+                candidates.append(path)
+
+    current_python = Path(sys.executable).expanduser().resolve()
+    if ".venv" not in current_python.parts:
+        candidates.append(current_python)
+
+    candidates.append(current_python)
+    return candidates[0]

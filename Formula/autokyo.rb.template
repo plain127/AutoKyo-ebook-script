@@ -1,0 +1,18 @@
+class Autokyo < Formula
+  include Language::Python::Virtualenv
+
+  desc "macOS local automation tool for page-by-page ebook viewer workflows"
+  homepage "https://github.com/plain127/AutoKyo-ebook-script"
+  url "https://github.com/plain127/AutoKyo-ebook-script/archive/refs/tags/v__VERSION__.tar.gz"
+  sha256 "__SHA256__"
+
+  depends_on "python@3.12"
+
+  def install
+    virtualenv_install_with_resources
+  end
+
+  test do
+    assert_match "autokyo", shell_output("#{bin}/autokyo --help")
+  end
+end
