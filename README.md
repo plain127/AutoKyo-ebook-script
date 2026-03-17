@@ -88,21 +88,6 @@ autokyo mcp-install antigravity
 - `AutoKyo 실행해줘`
 - `AutoKyo captures를 PDF로 만들어줘`
 
-Antigravity가 설정 파일을 못 찾으면 직접 지정하면 됩니다.
-
-```bash
-autokyo mcp-install antigravity --client-config /path/to/mcp_config.json
-```
-
-저장소에서 직접 실행 중이면 아래처럼 쓰면 됩니다.
-
-```bash
-python3 -m autokyo mcp-install codex
-python3 -m autokyo mcp-install claude
-python3 -m autokyo mcp-install openclaw
-python3 -m autokyo mcp-install antigravity --client-config /path/to/mcp_config.json
-```
-
 현재 MCP에서 노출하는 툴:
 
 - `setup_autokyo`
@@ -117,28 +102,6 @@ python3 -m autokyo mcp-install antigravity --client-config /path/to/mcp_config.j
 - `probe_region`
 - `build_pdf`
 
-
-## 세부 사용법
-1. 설치형으로 쓰는 경우 `python3 -m autokyo` 대신 `autokyo`만 쓰면 됩니다.
-
-2. 저장소에서 직접 실행 중이면 아래처럼 쓸 수 있습니다.
-
-```bash
-python3 -m autokyo setup
-python3 -m autokyo probe
-python3 -m autokyo run
-python3 -m autokyo pdf --delete-source
-```
-
-3. MCP 등록도 같은 방식으로 할 수 있습니다.
-
-```bash
-python3 -m autokyo mcp-install codex
-python3 -m autokyo mcp-install claude
-python3 -m autokyo mcp-install openclaw
-python3 -m autokyo mcp-install antigravity --client-config /path/to/mcp_config.json
-```
-
 ## 자주 쓰는 명령
 
 - `autokyo setup`: 캡처 버튼, 확인 버튼, 변화 영역을 순서대로 읽어 설정 저장
@@ -147,7 +110,8 @@ python3 -m autokyo mcp-install antigravity --client-config /path/to/mcp_config.j
 - `autokyo mousepos --watch`: 마우스 좌표 확인
 - `autokyo status`: 현재 세션 상태 출력
 - `autokyo pdf --delete-source`: `captures/`를 PDF로 만들고 원본 삭제
-- `autokyo mcp`: 로컬 stdio MCP 서버 실행
+- `autokyo mcp-http`: 로컬 streamable HTTP MCP 서버 수동 실행
+- `autokyo mcp`: 로컬 stdio MCP 서버 수동 실행
 
 ## 주의사항
 

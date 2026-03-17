@@ -21,7 +21,10 @@ class Autokyo < Formula
       Default config created at:
         #{Dir.home}/Library/Application Support/AutoKyo/config.toml
 
-      Edit this file before running `autokyo run` or `autokyo mcp-install ...`.
+      Edit this file before running `autokyo run`.
+
+      For Codex MCP over local HTTP:
+        autokyo mcp-install codex
     EOS
   end
 

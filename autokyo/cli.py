@@ -10,6 +10,15 @@ import time
 
 from autokyo.actions import AutomationError, get_mouse_position
 from autokyo.config import ConfigError, load_config, resolve_config_path, write_default_config
+from autokyo.mcp_http_server import run_streamable_http_server
+from autokyo.mcp_launchd import (
+    DEFAULT_HTTP_HOST,
+    DEFAULT_HTTP_PORT,
+    DEFAULT_HTTP_WAIT_SECONDS,
+    build_launch_agent_spec,
+    install_or_update_launch_agent,
+    wait_for_http_health,
+)
 from autokyo.mcp_server import run_stdio_server
 from autokyo.orchestrator import CaptureOrchestrator, OrchestratorError
 from autokyo.page_state import PageStateError, PageStateDetector
@@ -35,6 +44,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("mcp", help="Run the Autokyo MCP server over stdio")
+    mcp_http_parser = subparsers.add_parser(
+        "mcp-http",
+        help="Run the Autokyo MCP server over streamable HTTP",
+    )
+    mcp_http_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host interface to bind. Defaults to 127.0.0.1",
+    )
+    mcp_http_parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="TCP port to bind. Defaults to 8765",
+    )
     subparsers.add_parser(
         "init-config",
         help="Create the default config.toml in the standard AutoKyo config location",
@@ -186,6 +210,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Config scope for clients that support it. Defaults to user",
     )
     mcp_install_parser.add_argument(
+        "--transport",
+        choices=["auto", "stdio", "http"],
+        default="auto",
+        help="Transport to register. Defaults to http for codex/claude/antigravity and stdio for other clients",
+    )
+    mcp_install_parser.add_argument(
+        "--http-host",
+        default=DEFAULT_HTTP_HOST,
+        help=f"HTTP bind host for launchd-backed MCP. Defaults to {DEFAULT_HTTP_HOST}",
+    )
+    mcp_install_parser.add_argument(
+        "--http-port",
+        type=int,
+        default=DEFAULT_HTTP_PORT,
+        help=f"HTTP bind port for launchd-backed MCP. Defaults to {DEFAULT_HTTP_PORT}",
+    )
+    mcp_install_parser.add_argument(
+        "--http-wait-seconds",
+        type=float,
+        default=DEFAULT_HTTP_WAIT_SECONDS,
+        help=f"How long to wait for the HTTP server health check. Defaults to {DEFAULT_HTTP_WAIT_SECONDS}",
+    )
+    mcp_install_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the registration command without running it",
@@ -217,6 +264,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "mcp":
             return run_stdio_server(
                 default_config_path=resolve_config_path(args.config, must_exist=False)
+            )
+
+        if args.command == "mcp-http":
+            return run_streamable_http_server(
+                default_config_path=resolve_config_path(args.config, must_exist=False),
+                host=str(args.host),
+                port=int(args.port),
             )
 
         if args.command == "init-config":
@@ -273,6 +327,10 @@ def main(argv: list[str] | None = None) -> int:
                 python_executable=args.python_executable,
                 client_config_path=args.client_config,
                 scope=args.scope,
+                transport=args.transport,
+                http_host=args.http_host,
+                http_port=int(args.http_port),
+                http_wait_seconds=float(args.http_wait_seconds),
                 dry_run=bool(args.dry_run),
             )
 
@@ -505,6 +563,10 @@ def _install_mcp_server(
     python_executable: str | None,
     client_config_path: str | None,
     scope: str,
+    transport: str,
+    http_host: str,
+    http_port: int,
+    http_wait_seconds: float,
     dry_run: bool,
 ) -> int:
     normalized_client = "claude" if client == "claude-code" else client
@@ -513,10 +575,59 @@ def _install_mcp_server(
     if not resolved_config.exists() and not dry_run:
         write_default_config(resolved_config)
         config_created = True
+    resolved_transport = _resolve_mcp_transport(normalized_client, transport)
     invocation = _build_local_mcp_invocation(
         config_path=resolved_config,
         python_executable=python_executable,
     )
+    http_invocation = _build_local_http_mcp_invocation(
+        config_path=resolved_config,
+        python_executable=python_executable,
+        host=http_host,
+        port=http_port,
+    )
+
+    if normalized_client == "codex" and resolved_transport == "http":
+        return _install_codex_http_mcp_server(
+            server_name=server_name,
+            config_path=resolved_config,
+            config_created=config_created,
+            scope=scope,
+            http_invocation=http_invocation,
+            host=http_host,
+            port=http_port,
+            wait_seconds=http_wait_seconds,
+            dry_run=dry_run,
+        )
+
+    if normalized_client == "claude" and resolved_transport == "http":
+        return _install_claude_http_mcp_server(
+            server_name=server_name,
+            config_path=resolved_config,
+            config_created=config_created,
+            scope=scope,
+            http_invocation=http_invocation,
+            host=http_host,
+            port=http_port,
+            wait_seconds=http_wait_seconds,
+            dry_run=dry_run,
+        )
+
+    if normalized_client == "antigravity" and resolved_transport == "http":
+        return _install_antigravity_http_server(
+            server_name=server_name,
+            config_path=resolved_config,
+            config_created=config_created,
+            client_config_path=client_config_path,
+            http_invocation=http_invocation,
+            host=http_host,
+            port=http_port,
+            wait_seconds=http_wait_seconds,
+            dry_run=dry_run,
+        )
+
+    if resolved_transport == "http":
+        raise ValueError("HTTP transport registration is currently supported only for codex, claude, and antigravity")
 
     if normalized_client == "codex":
         client_executable = shutil.which("codex")
@@ -549,6 +660,7 @@ def _install_mcp_server(
             "client": normalized_client,
             "name": server_name,
             "scope": scope,
+            "transport": resolved_transport,
             "config_path": str(resolved_config),
             "config_created": config_created,
             "server_command": invocation,
@@ -579,6 +691,217 @@ def _install_mcp_server(
         )
     else:
         raise ValueError(f"Unsupported MCP client: {client}")
+
+
+def _install_codex_http_mcp_server(
+    *,
+    server_name: str,
+    config_path: Path,
+    config_created: bool,
+    scope: str,
+    http_invocation: list[str],
+    host: str,
+    port: int,
+    wait_seconds: float,
+    dry_run: bool,
+) -> int:
+    client_executable = shutil.which("codex")
+    if client_executable is None:
+        raise ValueError("Could not find 'codex' on PATH")
+
+    launch_agent = build_launch_agent_spec(
+        server_name=server_name,
+        command=http_invocation,
+        host=host,
+        port=port,
+        working_directory=config_path.parent,
+    )
+    remove_command = [client_executable, "mcp", "remove", server_name]
+    install_command = [
+        client_executable,
+        "mcp",
+        "add",
+        server_name,
+        "--url",
+        launch_agent.endpoint_url,
+    ]
+    payload = {
+        "status": "ready" if dry_run else "completed",
+        "client": "codex",
+        "name": server_name,
+        "scope": scope,
+        "transport": "http",
+        "config_path": str(config_path),
+        "config_created": config_created,
+        "server_command": http_invocation,
+        "remove_command": remove_command,
+        "install_command": install_command,
+        "endpoint_url": launch_agent.endpoint_url,
+        "healthcheck_url": launch_agent.healthcheck_url,
+        "launch_agent": {
+            "label": launch_agent.label,
+            "plist_path": str(launch_agent.plist_path),
+            "stdout_path": str(launch_agent.stdout_path),
+            "stderr_path": str(launch_agent.stderr_path),
+            "working_directory": str(launch_agent.working_directory),
+            "command": list(launch_agent.command),
+        },
+    }
+    if dry_run:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    install_or_update_launch_agent(launch_agent)
+    try:
+        wait_for_http_health(launch_agent.healthcheck_url, timeout_seconds=wait_seconds)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc} Check {launch_agent.stderr_path} and {launch_agent.stdout_path}."
+        ) from exc
+    subprocess.run(remove_command, check=False, capture_output=True, text=True)
+    subprocess.run(install_command, check=True)
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0
+
+
+def _install_claude_http_mcp_server(
+    *,
+    server_name: str,
+    config_path: Path,
+    config_created: bool,
+    scope: str,
+    http_invocation: list[str],
+    host: str,
+    port: int,
+    wait_seconds: float,
+    dry_run: bool,
+) -> int:
+    client_executable = shutil.which("claude")
+    if client_executable is None:
+        raise ValueError("Could not find 'claude' on PATH")
+
+    launch_agent = build_launch_agent_spec(
+        server_name=server_name,
+        command=http_invocation,
+        host=host,
+        port=port,
+        working_directory=config_path.parent,
+    )
+    remove_command = [client_executable, "mcp", "remove", server_name]
+    install_command = [
+        client_executable,
+        "mcp",
+        "add",
+        "--transport",
+        "http",
+        "--scope",
+        scope,
+        server_name,
+        launch_agent.endpoint_url,
+    ]
+    payload = {
+        "status": "ready" if dry_run else "completed",
+        "client": "claude",
+        "name": server_name,
+        "scope": scope,
+        "transport": "http",
+        "config_path": str(config_path),
+        "config_created": config_created,
+        "server_command": http_invocation,
+        "remove_command": remove_command,
+        "install_command": install_command,
+        "endpoint_url": launch_agent.endpoint_url,
+        "healthcheck_url": launch_agent.healthcheck_url,
+        "launch_agent": {
+            "label": launch_agent.label,
+            "plist_path": str(launch_agent.plist_path),
+            "stdout_path": str(launch_agent.stdout_path),
+            "stderr_path": str(launch_agent.stderr_path),
+            "working_directory": str(launch_agent.working_directory),
+            "command": list(launch_agent.command),
+        },
+    }
+    if dry_run:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    install_or_update_launch_agent(launch_agent)
+    try:
+        wait_for_http_health(launch_agent.healthcheck_url, timeout_seconds=wait_seconds)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc} Check {launch_agent.stderr_path} and {launch_agent.stdout_path}."
+        ) from exc
+    subprocess.run(remove_command, check=False, capture_output=True, text=True)
+    subprocess.run(install_command, check=True)
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0
+
+
+def _install_antigravity_http_server(
+    *,
+    server_name: str,
+    config_path: Path,
+    config_created: bool,
+    client_config_path: str | None,
+    http_invocation: list[str],
+    host: str,
+    port: int,
+    wait_seconds: float,
+    dry_run: bool,
+) -> int:
+    antigravity_config = _resolve_antigravity_config_path(client_config_path)
+    launch_agent = build_launch_agent_spec(
+        server_name=server_name,
+        command=http_invocation,
+        host=host,
+        port=port,
+        working_directory=config_path.parent,
+    )
+    config_data = _load_json_object(antigravity_config)
+    mcp_servers = config_data.setdefault("mcpServers", {})
+    mcp_servers[server_name] = {
+        "type": "http",
+        "url": launch_agent.endpoint_url,
+    }
+    payload = {
+        "status": "ready" if dry_run else "completed",
+        "client": "antigravity",
+        "name": server_name,
+        "transport": "http",
+        "config_path": str(config_path),
+        "config_created": config_created,
+        "client_config_path": str(antigravity_config),
+        "server_command": http_invocation,
+        "entry": {
+            "type": "http",
+            "url": launch_agent.endpoint_url,
+        },
+        "endpoint_url": launch_agent.endpoint_url,
+        "healthcheck_url": launch_agent.healthcheck_url,
+        "launch_agent": {
+            "label": launch_agent.label,
+            "plist_path": str(launch_agent.plist_path),
+            "stdout_path": str(launch_agent.stdout_path),
+            "stderr_path": str(launch_agent.stderr_path),
+            "working_directory": str(launch_agent.working_directory),
+            "command": list(launch_agent.command),
+        },
+    }
+    if dry_run:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    install_or_update_launch_agent(launch_agent)
+    try:
+        wait_for_http_health(launch_agent.healthcheck_url, timeout_seconds=wait_seconds)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc} Check {launch_agent.stderr_path} and {launch_agent.stdout_path}."
+        ) from exc
+    _write_json_object(antigravity_config, config_data)
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0
 
 
 def _install_antigravity_server(
@@ -754,18 +1077,48 @@ def _build_local_mcp_invocation(
     config_path: Path,
     python_executable: str | None,
 ) -> list[str]:
+    return _build_local_entrypoint_invocation(
+        config_path=config_path,
+        python_executable=python_executable,
+        subcommand="mcp",
+    )
+
+
+def _build_local_http_mcp_invocation(
+    *,
+    config_path: Path,
+    python_executable: str | None,
+    host: str,
+    port: int,
+) -> list[str]:
+    return _build_local_entrypoint_invocation(
+        config_path=config_path,
+        python_executable=python_executable,
+        subcommand="mcp-http",
+        subcommand_args=["--host", host, "--port", str(port)],
+    )
+
+
+def _build_local_entrypoint_invocation(
+    *,
+    config_path: Path,
+    python_executable: str | None,
+    subcommand: str,
+    subcommand_args: list[str] | None = None,
+) -> list[str]:
+    extra_args = subcommand_args or []
     self_command = _resolve_self_command()
     if self_command is not None:
-        return [str(self_command), "--config", str(config_path), "mcp"]
+        return [str(self_command), "--config", str(config_path), subcommand, *extra_args]
 
     python_path = _resolve_python_executable(python_executable)
     project_root = Path(__file__).resolve().parent.parent
     main_script = project_root / "main.py"
 
     if main_script.exists():
-        return [str(python_path), str(main_script), "--config", str(config_path), "mcp"]
+        return [str(python_path), str(main_script), "--config", str(config_path), subcommand, *extra_args]
 
-    return [str(python_path), "-m", "autokyo", "--config", str(config_path), "mcp"]
+    return [str(python_path), "-m", "autokyo", "--config", str(config_path), subcommand, *extra_args]
 
 
 def _resolve_self_command() -> Path | None:
@@ -773,13 +1126,20 @@ def _resolve_self_command() -> Path | None:
     if argv0.name != "autokyo":
         return None
 
-    if argv0.exists():
-        return argv0.resolve()
-
     resolved = shutil.which("autokyo")
     if resolved:
-        return Path(resolved).expanduser().resolve()
+        return Path(resolved).expanduser()
+    if argv0.exists():
+        return argv0
     return None
+
+
+def _resolve_mcp_transport(client: str, transport: str) -> str:
+    if transport != "auto":
+        return transport
+    if client in {"codex", "claude", "antigravity"}:
+        return "http"
+    return "stdio"
 
 
 def _resolve_python_executable(python_executable: str | None) -> Path:

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
+import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +35,36 @@ class JsonRpcError(RuntimeError):
 
 
 ToolHandler = Callable[[dict[str, Any]], dict[str, object]]
+SUPPORTED_PROTOCOL_VERSIONS = (
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+)
+DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+DEBUG_LOG_PATH = Path("/tmp/autokyo-mcp-debug.log")
+STDIO_MODE_NDJSON = "ndjson"
+STDIO_MODE_CONTENT_LENGTH = "content-length"
+
+
+def _debug_log(message: str) -> None:
+    try:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"{timestamp} pid={os.getpid()} {message}\n")
+    except OSError:
+        pass
+
+
+def _install_signal_debug_handlers() -> None:
+    def _handler(signum: int, _frame: object) -> None:
+        _debug_log(f"signal {signum}")
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGPIPE):
+        try:
+            signal.signal(signum, _handler)
+        except (ValueError, OSError):
+            continue
 
 SERVER_INSTRUCTIONS = (
     "You are operating a local AutoKyo workflow on macOS. "
@@ -94,20 +127,30 @@ class AutokyoMCPServer:
         }
 
     def serve(self) -> int:
+        _install_signal_debug_handlers()
         input_stream = sys.stdin.buffer
         output_stream = sys.stdout.buffer
+        stdio_mode: str | None = None
+        _debug_log("serve.start")
 
         while True:
-            message = self._read_message(input_stream)
+            message, detected_mode = self._read_message(input_stream)
             if message is None:
+                _debug_log("serve.eof")
                 return 0
+            if stdio_mode is None:
+                stdio_mode = detected_mode
+                _debug_log(f"serve.mode {stdio_mode}")
 
             if "id" not in message:
+                _debug_log(f"notification method={message.get('method')}")
                 self._handle_notification(message)
                 continue
 
+            _debug_log(f"request method={message.get('method')} id={message.get('id')}")
             response = self._handle_request(message)
-            self._write_message(output_stream, response)
+            self._write_message(output_stream, response, mode=stdio_mode or STDIO_MODE_NDJSON)
+            _debug_log(f"response.write id={response.get('id')}")
 
     def _handle_notification(self, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -124,12 +167,18 @@ class AutokyoMCPServer:
                 raise JsonRpcError(-32602, "params must be an object")
 
             if method == "initialize":
+                requested_protocol_version = params.get("protocolVersion")
+                protocol_version = self._resolve_protocol_version(requested_protocol_version)
                 self._initialized = True
                 return self._result(
                     request_id,
                     {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {"tools": {}},
+                        "protocolVersion": protocol_version,
+                        "capabilities": {
+                            "tools": {},
+                            "resources": {},
+                            "prompts": {},
+                        },
                         "serverInfo": {
                             "name": "autokyo",
                             "version": __version__,
@@ -152,13 +201,18 @@ class AutokyoMCPServer:
             if method == "resources/list":
                 return self._result(request_id, {"resources": []})
 
+            if method == "resources/templates/list":
+                return self._result(request_id, {"resourceTemplates": []})
+
             if method == "prompts/list":
                 return self._result(request_id, {"prompts": []})
 
             raise JsonRpcError(-32601, f"Method not found: {method}")
         except JsonRpcError as exc:
+            _debug_log(f"request.error code={exc.code} method={message.get('method')} message={exc.message}")
             return self._error(request_id, exc.code, exc.message, exc.data)
         except Exception as exc:  # pragma: no cover - defensive fallback
+            _debug_log(f"request.exception method={message.get('method')} error={exc!r}")
             return self._error(request_id, -32603, str(exc))
 
     def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -684,6 +738,11 @@ class AutokyoMCPServer:
             raise JsonRpcError(-32602, f"{key} must be a boolean")
         return value
 
+    def _resolve_protocol_version(self, requested_version: object) -> str:
+        if isinstance(requested_version, str) and requested_version in SUPPORTED_PROTOCOL_VERSIONS:
+            return requested_version
+        return DEFAULT_PROTOCOL_VERSION
+
     def _float_arg(self, arguments: dict[str, Any], key: str, default: float) -> float:
         value = arguments.get(key, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -760,29 +819,51 @@ class AutokyoMCPServer:
             error["data"] = data
         return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
-    def _read_message(self, stream: Any) -> dict[str, Any] | None:
-        content_length: int | None = None
+    def _read_message(self, stream: Any) -> tuple[dict[str, Any] | None, str]:
+        line = stream.readline()
+        if not line:
+            return None, STDIO_MODE_NDJSON
 
-        while True:
-            line = stream.readline()
-            if not line:
-                return None
-            if line in (b"\r\n", b"\n"):
-                break
-            header = line.decode("utf-8").strip()
-            if not header:
-                break
-            name, _, value = header.partition(":")
-            if name.lower() == "content-length":
-                content_length = int(value.strip())
+        if line.startswith(b"Content-Length:"):
+            content_length = self._parse_content_length_header(line)
+            while True:
+                header_line = stream.readline()
+                if not header_line:
+                    raise JsonRpcError(-32700, "Unexpected EOF while reading message headers")
+                if header_line in (b"\r\n", b"\n"):
+                    break
+                header = header_line.decode("utf-8").strip()
+                if not header:
+                    break
+                name, _, value = header.partition(":")
+                if name.lower() == "content-length":
+                    content_length = int(value.strip())
 
-        if content_length is None:
-            raise JsonRpcError(-32700, "Missing Content-Length header")
+            payload = stream.read(content_length)
+            if len(payload) != content_length:
+                raise JsonRpcError(-32700, "Unexpected EOF while reading message body")
+            return self._decode_message(payload), STDIO_MODE_CONTENT_LENGTH
 
-        payload = stream.read(content_length)
-        if len(payload) != content_length:
-            raise JsonRpcError(-32700, "Unexpected EOF while reading message body")
+        payload = line.strip()
+        if not payload:
+            return self._read_message(stream)
+        return self._decode_message(payload), STDIO_MODE_NDJSON
 
+    def _write_message(self, stream: Any, message: dict[str, Any], *, mode: str) -> None:
+        payload = json.dumps(message, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        if mode == STDIO_MODE_CONTENT_LENGTH:
+            header = f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+            _debug_log(f"write.begin bytes={len(header) + len(payload)} id={message.get('id')} mode={mode}")
+            stream.write(header)
+            stream.write(payload)
+        else:
+            framed_payload = payload + b"\n"
+            _debug_log(f"write.begin bytes={len(framed_payload)} id={message.get('id')} mode={mode}")
+            stream.write(framed_payload)
+        stream.flush()
+        _debug_log(f"write.end id={message.get('id')}")
+
+    def _decode_message(self, payload: bytes) -> dict[str, Any]:
         try:
             message = json.loads(payload.decode("utf-8"))
         except json.JSONDecodeError as exc:
@@ -791,12 +872,16 @@ class AutokyoMCPServer:
             raise JsonRpcError(-32600, "Request body must be a JSON object")
         return message
 
-    def _write_message(self, stream: Any, message: dict[str, Any]) -> None:
-        payload = json.dumps(message, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-        header = f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
-        stream.write(header)
-        stream.write(payload)
-        stream.flush()
+    def _parse_content_length_header(self, line: bytes) -> int:
+        try:
+            header = line.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise JsonRpcError(-32700, f"Invalid header encoding: {exc}") from exc
+        _, _, value = header.partition(":")
+        try:
+            return int(value.strip())
+        except ValueError as exc:
+            raise JsonRpcError(-32700, "Invalid Content-Length header") from exc
 
 
 def run_stdio_server(*, default_config_path: str | Path = DEFAULT_CONFIG_PATH) -> int:
